@@ -1,7 +1,11 @@
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { AvatarModelLoader, LoadedAvatar } from "../../services/avatarModelLoader";
+import {
+  AvatarModelLoader,
+  LoadedAvatar,
+  resolveMorphWeight,
+} from "../../services/avatarModelLoader";
 import { LipSyncEngine, VisemeWeights } from "../../services/lipSyncEngine";
 import {
   Upload,
@@ -242,11 +246,17 @@ export const AvatarCanvas: React.FC<AvatarCanvasProps> = ({
 
           Object.keys(mesh.morphTargetDictionary).forEach((morphName) => {
             const index = mesh.morphTargetDictionary![morphName];
-            const targetVal = targetMorphInfluences.current[morphName] ?? 0;
+            // Resolve target using alias map (supports ARKit, CC4, ReadyPlayerMe, Oculus visemes, Blender keys)
+            const targetVal = resolveMorphWeight(morphName, targetMorphInfluences.current);
             const currentVal = currentMorphInfluences.current[morphName] ?? 0;
 
-            // Damping lerp factor: 0.3 for rapid speech sync, 0.15 for subtle eye shifts
-            const lerpSpeed = morphName.includes("jaw") || morphName.includes("viseme") ? 0.35 : 0.2;
+            // Damping lerp factor: 0.35 for rapid speech sync, 0.2 for subtle eye shifts
+            const isSpeechMorph =
+              morphName.toLowerCase().includes("jaw") ||
+              morphName.toLowerCase().includes("viseme") ||
+              morphName.toLowerCase().includes("mouth") ||
+              morphName.toLowerCase().includes("open");
+            const lerpSpeed = isSpeechMorph ? 0.35 : 0.2;
             const smoothedVal = THREE.MathUtils.lerp(currentVal, targetVal, lerpSpeed);
 
             currentMorphInfluences.current[morphName] = smoothedVal;
@@ -304,16 +314,15 @@ export const AvatarCanvas: React.FC<AvatarCanvasProps> = ({
   };
 
   /**
-   * Load custom user .glb model (e.g. exported from Reallusion CC4)
+   * Load custom user 3D model (.glb, .gltf, .vrm, .obj - e.g. Reallusion CC4, ReadyPlayerMe, Blender)
    */
   const loadCustomModelFile = async (file: File) => {
     if (!sceneRef.current) return;
     setIsLoading(true);
-    setStatusMessage(`Loading ${file.name}...`);
+    setStatusMessage(`Parsing 3D mesh and morph targets from ${file.name}...`);
 
     try {
-      const objectUrl = URL.createObjectURL(file);
-      const loadedAvatar = await AvatarModelLoader.loadGLB(objectUrl);
+      const loadedAvatar = await AvatarModelLoader.loadFromFile(file);
 
       // Remove existing model from scene
       if (avatarRef.current) {
@@ -323,22 +332,31 @@ export const AvatarCanvas: React.FC<AvatarCanvasProps> = ({
       sceneRef.current.add(loadedAvatar.root);
       avatarRef.current = loadedAvatar;
 
+      // Adjust camera and orbit controls to frame the avatar
+      if (cameraRef.current && controlsRef.current) {
+        cameraRef.current.position.set(0, 0, 2.6);
+        controlsRef.current.target.set(0, 0, 0);
+        controlsRef.current.update();
+      }
+
       setModelName(file.name);
       setIsCustomModel(true);
       setMorphTargetNames(loadedAvatar.morphNames);
       setStatusMessage(
-        `Loaded ${file.name} (${loadedAvatar.morphNames.length} blendshapes detected)`
+        `Loaded ${file.name} (${loadedAvatar.morphNames.length} morph targets detected)`
       );
     } catch (err: any) {
-      console.error("Error loading GLB:", err);
-      setStatusMessage(`Failed to load GLB: ${err.message || "Invalid file"}`);
+      console.error("Error parsing 3D file:", err);
+      setStatusMessage(
+        `Failed to parse 3D file: ${err.message || "Invalid or unsupported file format"}`
+      );
     } finally {
       setIsLoading(false);
     }
   };
 
   /**
-   * Handle Drag and Drop of .glb files
+   * Handle Drag and Drop of 3D files (.glb, .gltf, .vrm, .obj)
    */
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
@@ -346,10 +364,11 @@ export const AvatarCanvas: React.FC<AvatarCanvasProps> = ({
 
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
       const file = e.dataTransfer.files[0];
-      if (file.name.toLowerCase().endsWith(".glb") || file.name.toLowerCase().endsWith(".gltf")) {
+      const ext = file.name.split(".").pop()?.toLowerCase();
+      if (ext === "glb" || ext === "gltf" || ext === "vrm" || ext === "obj") {
         loadCustomModelFile(file);
       } else {
-        setStatusMessage("Please drop a .glb or .gltf 3D file.");
+        setStatusMessage("Please drop a 3D file (.glb, .gltf, .vrm, or .obj).");
       }
     }
   };
@@ -361,6 +380,7 @@ export const AvatarCanvas: React.FC<AvatarCanvasProps> = ({
     if (e.target.files && e.target.files.length > 0) {
       const file = e.target.files[0];
       loadCustomModelFile(file);
+      e.target.value = "";
     }
   };
 
@@ -450,10 +470,18 @@ export const AvatarCanvas: React.FC<AvatarCanvasProps> = ({
 
         {/* Action Controls */}
         <div className="flex items-center gap-2 pointer-events-auto">
-          <label className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-800/90 hover:bg-slate-700/90 text-sky-300 border border-sky-500/20 text-xs font-medium cursor-pointer shadow-lg transition">
+          <label
+            title="Load 3D mesh avatar (.glb, .gltf, .vrm, .obj from CC4, ReadyPlayerMe, Blender)"
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-800/90 hover:bg-slate-700/90 text-sky-300 border border-sky-500/20 text-xs font-medium cursor-pointer shadow-lg transition"
+          >
             <Upload className="w-3.5 h-3.5" />
-            <span>Load CC4 .glb</span>
-            <input type="file" accept=".glb,.gltf" onChange={handleFileInput} className="hidden" />
+            <span>Load 3D Model</span>
+            <input
+              type="file"
+              accept=".glb,.gltf,.vrm,.obj"
+              onChange={handleFileInput}
+              className="hidden"
+            />
           </label>
 
           <button

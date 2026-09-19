@@ -1,5 +1,7 @@
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+import { DRACOLoader } from "three/examples/jsm/loaders/DRACOLoader.js";
+import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
 
 export interface MorphTargetInfo {
   name: string;
@@ -17,86 +19,231 @@ export interface LoadedAvatar {
   isCustomModel: boolean;
 }
 
+/**
+ * Smart resolver to map varied 3D avatar morph target names (CC4, ReadyPlayerMe,
+ * Apple ARKit 52, Blender Shape Keys, Oculus Visemes) to standard speech & expression channels.
+ */
+export function resolveMorphWeight(
+  meshMorphName: string,
+  targetWeights: Record<string, number>
+): number {
+  if (targetWeights[meshMorphName] !== undefined) {
+    return targetWeights[meshMorphName];
+  }
+
+  // Strip common mesh or namespace prefixes (e.g., "CC_Base_Head.", "Wolf3D_Head.", "BlendShape1.")
+  const cleanName = meshMorphName.replace(/^[a-zA-Z0-9_-]+\./, "");
+  if (targetWeights[cleanName] !== undefined) {
+    return targetWeights[cleanName];
+  }
+
+  const norm = cleanName.toLowerCase().replace(/[^a-z0-9]/g, "");
+
+  // 1. Jaw Open / Mouth Open / Open Viseme
+  if (
+    norm.includes("jawopen") ||
+    norm.includes("mouthopen") ||
+    norm === "open" ||
+    norm.includes("openmouth") ||
+    norm.includes("mouthdrop") ||
+    norm === "jaw"
+  ) {
+    return targetWeights["jawOpen"] ?? 0;
+  }
+
+  // 2. Visemes
+  if (norm.includes("visemeaa") || norm === "aa" || norm.includes("mouthah")) {
+    return targetWeights["viseme_aa"] ?? targetWeights["jawOpen"] ?? 0;
+  }
+  if (norm.includes("visemee") || norm === "ee") {
+    return targetWeights["viseme_E"] ?? 0;
+  }
+  if (norm.includes("visemei") || norm === "ih") {
+    return targetWeights["viseme_I"] ?? 0;
+  }
+  if (norm.includes("visemeo") || norm === "oh") {
+    return targetWeights["viseme_O"] ?? targetWeights["mouthFunnel"] ?? 0;
+  }
+  if (norm.includes("visemeu") || norm === "ou") {
+    return targetWeights["viseme_U"] ?? targetWeights["mouthPucker"] ?? 0;
+  }
+  if (norm.includes("visemepp") || norm.includes("visememb") || norm.includes("mouthclose")) {
+    return targetWeights["viseme_PP"] ?? 0;
+  }
+  if (norm.includes("visemeff") || norm.includes("visemevv")) {
+    return targetWeights["viseme_FF"] ?? 0;
+  }
+  if (norm.includes("visemeth")) {
+    return targetWeights["viseme_TH"] ?? 0;
+  }
+  if (norm.includes("visemech") || norm.includes("visemedd")) {
+    return targetWeights["viseme_CH"] ?? 0;
+  }
+  if (norm.includes("visemess")) {
+    return targetWeights["viseme_SS"] ?? 0;
+  }
+
+  // 3. Smile Left / Right
+  if (
+    (norm.includes("smile") || norm.includes("grin")) &&
+    (norm.includes("left") || norm.endsWith("l") || norm.includes("_l"))
+  ) {
+    return targetWeights["mouthSmileLeft"] ?? 0;
+  }
+  if (
+    (norm.includes("smile") || norm.includes("grin")) &&
+    (norm.includes("right") || norm.endsWith("r") || norm.includes("_r"))
+  ) {
+    return targetWeights["mouthSmileRight"] ?? 0;
+  }
+  if (norm.includes("smile")) {
+    return targetWeights["mouthSmileLeft"] ?? targetWeights["mouthSmileRight"] ?? 0;
+  }
+
+  // 4. Eye Blink Left / Right
+  if (
+    (norm.includes("blink") || norm.includes("eyeclose") || norm.includes("eyesclose")) &&
+    (norm.includes("left") || norm.endsWith("l") || norm.includes("_l"))
+  ) {
+    return targetWeights["eyeBlinkLeft"] ?? 0;
+  }
+  if (
+    (norm.includes("blink") || norm.includes("eyeclose") || norm.includes("eyesclose")) &&
+    (norm.includes("right") || norm.endsWith("r") || norm.includes("_r"))
+  ) {
+    return targetWeights["eyeBlinkRight"] ?? 0;
+  }
+  if (norm.includes("blink") || norm.includes("eyesclosed") || norm.includes("eyeclose")) {
+    return targetWeights["eyeBlinkLeft"] ?? targetWeights["eyeBlinkRight"] ?? 0;
+  }
+
+  // 5. Mouth Pucker & Funnel
+  if (norm.includes("pucker") || norm.includes("kiss") || norm.includes("whistle")) {
+    return targetWeights["mouthPucker"] ?? 0;
+  }
+  if (norm.includes("funnel") || norm.includes("moutho")) {
+    return targetWeights["mouthFunnel"] ?? 0;
+  }
+
+  // 6. Brows
+  if (norm.includes("brow") && (norm.includes("up") || norm.includes("raise"))) {
+    return targetWeights["browInnerUp"] ?? 0;
+  }
+
+  return 0;
+}
+
 export class AvatarModelLoader {
-  private static gltfLoader = new GLTFLoader();
+  private static gltfLoader: GLTFLoader | null = null;
+
+  private static getGLTFLoader(): GLTFLoader {
+    if (!this.gltfLoader) {
+      const loader = new GLTFLoader();
+      try {
+        const draco = new DRACOLoader();
+        draco.setDecoderPath("https://www.gstatic.com/draco/versioned/decoders/1.5.7/");
+        loader.setDRACOLoader(draco);
+      } catch (e) {
+        console.warn("Could not initialize DRACOLoader:", e);
+      }
+      this.gltfLoader = loader;
+    }
+    return this.gltfLoader;
+  }
 
   /**
-   * Loads a .glb model from a URL or Object URL
+   * Loads custom 3D model directly from a user File in memory.
+   * Handles .glb, .gltf, .vrm, and .obj formats with both arrayBuffer and blob URL fallback.
    */
-  public static async loadGLB(url: string): Promise<LoadedAvatar> {
+  public static async loadFromFile(file: File): Promise<LoadedAvatar> {
+    const ext = file.name.split(".").pop()?.toLowerCase() || "";
+
+    if (ext === "obj") {
+      const text = await file.text();
+      const objLoader = new OBJLoader();
+      const root = objLoader.parse(text);
+      return this.processLoadedScene(root);
+    }
+
+    // Try in-memory arrayBuffer first
+    try {
+      const buffer = await file.arrayBuffer();
+      const loader = this.getGLTFLoader();
+      return await new Promise<LoadedAvatar>((resolve, reject) => {
+        loader.parse(
+          buffer,
+          "",
+          (gltf) => {
+            try {
+              const root = gltf.scene || (gltf.scenes && gltf.scenes[0]) || gltf;
+              resolve(this.processLoadedScene(root as THREE.Group));
+            } catch (err) {
+              reject(err);
+            }
+          },
+          (err) => reject(err)
+        );
+      });
+    } catch (parseErr) {
+      console.warn("Direct buffer parsing failed, attempting blob URL fallback:", parseErr);
+      const blobUrl = URL.createObjectURL(file);
+      try {
+        const loader = this.getGLTFLoader();
+        return await new Promise<LoadedAvatar>((resolve, reject) => {
+          loader.load(
+            blobUrl,
+            (gltf) => {
+              try {
+                const root = gltf.scene || (gltf.scenes && gltf.scenes[0]) || gltf;
+                resolve(this.processLoadedScene(root as THREE.Group));
+              } catch (err) {
+                reject(err);
+              }
+            },
+            undefined,
+            (err) => reject(err)
+          );
+        });
+      } finally {
+        URL.revokeObjectURL(blobUrl);
+      }
+    }
+  }
+
+  /**
+   * Loads a .glb/.gltf model from a URL or ArrayBuffer
+   */
+  public static async loadGLB(urlOrBuffer: string | ArrayBuffer): Promise<LoadedAvatar> {
+    const loader = this.getGLTFLoader();
+
+    if (typeof urlOrBuffer !== "string") {
+      return new Promise((resolve, reject) => {
+        loader.parse(
+          urlOrBuffer,
+          "",
+          (gltf) => {
+            try {
+              const root = gltf.scene || (gltf.scenes && gltf.scenes[0]);
+              resolve(this.processLoadedScene(root));
+            } catch (err) {
+              reject(err);
+            }
+          },
+          reject
+        );
+      });
+    }
+
     return new Promise((resolve, reject) => {
-      this.gltfLoader.load(
-        url,
+      loader.load(
+        urlOrBuffer,
         (gltf) => {
-          const root = gltf.scene;
-
-          // Find head mesh (CC_Base_Head or any mesh with morph targets)
-          let headMesh: THREE.SkinnedMesh | THREE.Mesh | null = null;
-          const allMorphMeshes: Array<THREE.SkinnedMesh | THREE.Mesh> = [];
-          const combinedDictionary: Record<string, number> = {};
-          let headBone: THREE.Bone | THREE.Object3D | undefined;
-
-          root.traverse((child) => {
-            if ((child as THREE.Bone).isBone) {
-              const nameLower = child.name.toLowerCase();
-              if (nameLower.includes("head") || nameLower.includes("neck")) {
-                if (!headBone) headBone = child;
-              }
-            }
-
-            if ((child as THREE.Mesh).isMesh || (child as THREE.SkinnedMesh).isSkinnedMesh) {
-              const mesh = child as THREE.SkinnedMesh | THREE.Mesh;
-              if (mesh.morphTargetDictionary && mesh.morphTargetInfluences) {
-                allMorphMeshes.push(mesh);
-
-                const nameLower = mesh.name.toLowerCase();
-                // Check if this is CC_Base_Head or main head mesh
-                if (
-                  nameLower.includes("cc_base_head") ||
-                  nameLower === "head" ||
-                  nameLower.includes("head") ||
-                  nameLower.includes("face")
-                ) {
-                  headMesh = mesh;
-                }
-
-                // Merge morph target names
-                Object.keys(mesh.morphTargetDictionary).forEach((mName) => {
-                  combinedDictionary[mName] = mesh.morphTargetDictionary![mName];
-                });
-              }
-            }
-          });
-
-          // Fallback to first mesh with morph targets if CC_Base_Head not explicitly matched
-          if (!headMesh && allMorphMeshes.length > 0) {
-            headMesh = allMorphMeshes[0];
+          try {
+            const root = gltf.scene || (gltf.scenes && gltf.scenes[0]);
+            resolve(this.processLoadedScene(root));
+          } catch (err) {
+            reject(err);
           }
-
-          // Center & scale model to fit scene
-          const box = new THREE.Box3().setFromObject(root);
-          const size = box.getSize(new THREE.Vector3());
-          const center = box.getCenter(new THREE.Vector3());
-
-          // Normalize size to ~2 units tall
-          const maxDim = Math.max(size.x, size.y, size.z);
-          if (maxDim > 0) {
-            const scale = 2.0 / maxDim;
-            root.scale.setScalar(scale);
-            root.position.x = -center.x * scale;
-            root.position.y = -center.y * scale;
-            root.position.z = -center.z * scale;
-          }
-
-          resolve({
-            root,
-            headMesh,
-            allMorphMeshes,
-            morphDictionary: combinedDictionary,
-            morphNames: Object.keys(combinedDictionary),
-            headBone,
-            isCustomModel: true,
-          });
         },
         undefined,
         (error) => {
@@ -104,6 +251,229 @@ export class AvatarModelLoader {
         }
       );
     });
+  }
+
+  /**
+   * Common scene processing: detects morph targets across all meshes,
+   * configures materials, creates procedural fallbacks if needed, and normalizes scale.
+   */
+  private static processLoadedScene(root: THREE.Group | THREE.Object3D): LoadedAvatar {
+    let headMesh: THREE.SkinnedMesh | THREE.Mesh | null = null;
+    const allMorphMeshes: Array<THREE.SkinnedMesh | THREE.Mesh> = [];
+    const combinedDictionary: Record<string, number> = {};
+    let headBone: THREE.Bone | THREE.Object3D | undefined;
+
+    root.traverse((child) => {
+      // Find bone for head tilt & idle sway
+      if ((child as THREE.Bone).isBone) {
+        const nameLower = child.name.toLowerCase();
+        if (nameLower.includes("head") || nameLower.includes("neck")) {
+          if (!headBone) headBone = child;
+        }
+      }
+
+      // Check meshes for morph targets
+      if ((child as THREE.Mesh).isMesh || (child as THREE.SkinnedMesh).isSkinnedMesh) {
+        const mesh = child as THREE.SkinnedMesh | THREE.Mesh;
+
+        // Enhance material rendering
+        if (mesh.material) {
+          const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+          materials.forEach((mat) => {
+            mat.side = THREE.DoubleSide;
+            if (mat instanceof THREE.MeshStandardMaterial) {
+              mat.roughness = Math.min(mat.roughness, 0.85);
+              mat.envMapIntensity = 1.0;
+            }
+          });
+        }
+
+        // Check if morph attributes exist on geometry even if dictionary is unpopulated
+        const geom = mesh.geometry;
+        if (geom && geom.morphAttributes && geom.morphAttributes.position && geom.morphAttributes.position.length > 0) {
+          if (!mesh.morphTargetDictionary) {
+            mesh.morphTargetDictionary = {};
+            geom.morphAttributes.position.forEach((attr: any, idx: number) => {
+              const mName = attr.name || `morph_${idx}`;
+              mesh.morphTargetDictionary![mName] = idx;
+            });
+          }
+          if (!mesh.morphTargetInfluences) {
+            mesh.morphTargetInfluences = new Array(
+              Object.keys(mesh.morphTargetDictionary).length
+            ).fill(0);
+          }
+        }
+
+        if (mesh.morphTargetDictionary && mesh.morphTargetInfluences) {
+          allMorphMeshes.push(mesh);
+
+          const nameLower = mesh.name.toLowerCase();
+          if (
+            nameLower.includes("wolf3d_head") ||
+            nameLower.includes("cc_base_head") ||
+            nameLower === "head" ||
+            nameLower.includes("head") ||
+            nameLower.includes("face")
+          ) {
+            if (!headMesh) headMesh = mesh;
+          }
+
+          Object.keys(mesh.morphTargetDictionary).forEach((mName) => {
+            combinedDictionary[mName] = mesh.morphTargetDictionary![mName];
+          });
+        }
+      }
+    });
+
+    // Fallback to first morph mesh if headMesh not explicitly named
+    if (!headMesh && allMorphMeshes.length > 0) {
+      headMesh = allMorphMeshes[0];
+    }
+
+    // If no mesh had morph targets (e.g. static OBJ, standard low-poly head),
+    // generate procedural jaw and expression morphs on the primary mesh so it can still animate!
+    if (allMorphMeshes.length === 0) {
+      let candidateMesh: THREE.Mesh | null = null;
+      root.traverse((child) => {
+        if (!candidateMesh && (child as THREE.Mesh).isMesh) {
+          candidateMesh = child as THREE.Mesh;
+        }
+      });
+
+      if (candidateMesh) {
+        const meshToMorph: THREE.Mesh = candidateMesh;
+        this.addProceduralMorphTargetsToMesh(meshToMorph);
+        allMorphMeshes.push(meshToMorph);
+        headMesh = meshToMorph;
+        if (meshToMorph.morphTargetDictionary) {
+          Object.keys(meshToMorph.morphTargetDictionary).forEach((mName) => {
+            combinedDictionary[mName] = meshToMorph.morphTargetDictionary![mName];
+          });
+        }
+      }
+    }
+
+    // Reset root transforms first
+    root.position.set(0, 0, 0);
+    root.rotation.set(0, 0, 0);
+    root.scale.set(1, 1, 1);
+    root.updateMatrixWorld(true);
+
+    // Compute unscaled target framing bounds
+    const framingTarget = headMesh || root;
+    framingTarget.updateMatrixWorld(true);
+    const framingBox = new THREE.Box3().setFromObject(framingTarget);
+    const framingCenter = framingBox.getCenter(new THREE.Vector3());
+    const framingSize = framingBox.getSize(new THREE.Vector3());
+
+    // Scale avatar so the head & face fit prominently in the viewport (height ~1.65)
+    const targetHeight = Math.max(framingSize.y, framingSize.x * 0.85, 0.2);
+    const desiredHeight = 1.65;
+    const scale = desiredHeight / targetHeight;
+
+    // Apply scale to root
+    root.scale.setScalar(scale);
+
+    // Position root so the target's center sits exactly at world origin (0, 0, 0)
+    root.position.x = -framingCenter.x * scale;
+    root.position.y = -framingCenter.y * scale;
+    root.position.z = -framingCenter.z * scale;
+    root.updateMatrixWorld(true);
+
+    return {
+      root,
+      headMesh,
+      allMorphMeshes,
+      morphDictionary: combinedDictionary,
+      morphNames: Object.keys(combinedDictionary),
+      headBone,
+      isCustomModel: true,
+    };
+  }
+
+  /**
+   * Generates procedural facial blendshapes for static geometries that lack native morph targets
+   */
+  private static addProceduralMorphTargetsToMesh(mesh: THREE.Mesh | THREE.SkinnedMesh): void {
+    const geom = mesh.geometry;
+    if (!geom || !geom.attributes.position) return;
+
+    const positionAttr = geom.attributes.position;
+    const count = positionAttr.count;
+
+    geom.computeBoundingBox();
+    const box = geom.boundingBox || new THREE.Box3();
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+
+    const jawOpenArr = new Float32Array(count * 3);
+    const smileLeftArr = new Float32Array(count * 3);
+    const smileRightArr = new Float32Array(count * 3);
+    const blinkLeftArr = new Float32Array(count * 3);
+    const blinkRightArr = new Float32Array(count * 3);
+
+    for (let i = 0; i < count; i++) {
+      const x = positionAttr.getX(i);
+      const y = positionAttr.getY(i);
+      const z = positionAttr.getZ(i);
+
+      const dy = (y - center.y) / (size.y * 0.5 || 1);
+      const dz = (z - center.z) / (size.z * 0.5 || 1);
+      const dx = (x - center.x) / (size.x * 0.5 || 1);
+
+      // Mouth region (lower front)
+      if (dy < 0 && dy > -0.7 && dz > 0.05) {
+        const mouthWeight = Math.max(0, 1 - Math.abs(dx) * 2.5) * Math.max(0, 1 - Math.abs(dy + 0.3) * 3);
+        jawOpenArr[i * 3 + 1] = -mouthWeight * 0.12 * size.y;
+        jawOpenArr[i * 3 + 2] = mouthWeight * 0.03 * size.z;
+
+        if (dx < -0.1) {
+          smileLeftArr[i * 3] = mouthWeight * -0.04 * size.x;
+          smileLeftArr[i * 3 + 1] = mouthWeight * 0.05 * size.y;
+        }
+        if (dx > 0.1) {
+          smileRightArr[i * 3] = mouthWeight * 0.04 * size.x;
+          smileRightArr[i * 3 + 1] = mouthWeight * 0.05 * size.y;
+        }
+      }
+
+      // Eye region (upper front)
+      if (dy > 0.05 && dy < 0.5 && dz > 0.15) {
+        if (dx < -0.15 && dx > -0.65) {
+          const eyeWeight = Math.max(0, 1 - Math.hypot(dx + 0.35, dy - 0.25) * 4);
+          blinkLeftArr[i * 3 + 1] = -eyeWeight * 0.04 * size.y;
+        }
+        if (dx > 0.15 && dx < 0.65) {
+          const eyeWeight = Math.max(0, 1 - Math.hypot(dx - 0.35, dy - 0.25) * 4);
+          blinkRightArr[i * 3 + 1] = -eyeWeight * 0.04 * size.y;
+        }
+      }
+    }
+
+    const jawAttr = new THREE.BufferAttribute(jawOpenArr, 3);
+    const smileLAttr = new THREE.BufferAttribute(smileLeftArr, 3);
+    const smileRAttr = new THREE.BufferAttribute(smileRightArr, 3);
+    const blinkLAttr = new THREE.BufferAttribute(blinkLeftArr, 3);
+    const blinkRAttr = new THREE.BufferAttribute(blinkRightArr, 3);
+
+    jawAttr.name = "jawOpen";
+    smileLAttr.name = "mouthSmileLeft";
+    smileRAttr.name = "mouthSmileRight";
+    blinkLAttr.name = "eyeBlinkLeft";
+    blinkRAttr.name = "eyeBlinkRight";
+
+    geom.morphAttributes.position = [jawAttr, smileLAttr, smileRAttr, blinkLAttr, blinkRAttr];
+
+    mesh.morphTargetDictionary = {
+      jawOpen: 0,
+      mouthSmileLeft: 1,
+      mouthSmileRight: 2,
+      eyeBlinkLeft: 3,
+      eyeBlinkRight: 4,
+    };
+    mesh.morphTargetInfluences = [0, 0, 0, 0, 0];
+    mesh.updateMorphTargets();
   }
 
   /**
